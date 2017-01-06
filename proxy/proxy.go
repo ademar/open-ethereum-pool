@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"github.com/gorilla/mux"
 	"io"
 	"log"
 	"net"
@@ -12,10 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"../policy"
-	"../rpc"
-	"../storage"
-	"../util"
+	"github.com/gorilla/mux"
+
+	"github.com/sammy007/open-ethereum-pool/policy"
+	"github.com/sammy007/open-ethereum-pool/rpc"
+	"github.com/sammy007/open-ethereum-pool/storage"
+	"github.com/sammy007/open-ethereum-pool/util"
 )
 
 type ProxyServer struct {
@@ -31,7 +32,7 @@ type ProxyServer struct {
 
 	// Stratum
 	sessionsMu sync.RWMutex
-	sessions   map[int64]*Session
+	sessions   map[*Session]struct{}
 	timeout    time.Duration
 }
 
@@ -42,7 +43,6 @@ type Session struct {
 	// Stratum
 	sync.Mutex
 	conn  *net.TCPConn
-	uuid  int64
 	login string
 }
 
@@ -63,23 +63,22 @@ func NewProxy(cfg *Config, backend *storage.RedisClient) *ProxyServer {
 	log.Printf("Default upstream: %s => %s", proxy.rpc().Name, proxy.rpc().Url)
 
 	if cfg.Proxy.Stratum.Enabled {
-		proxy.sessions = make(map[int64]*Session)
-
+		proxy.sessions = make(map[*Session]struct{})
 		go proxy.ListenTCP()
 	}
 
 	proxy.fetchBlockTemplate()
 
-	proxy.hashrateExpiration, _ = time.ParseDuration(cfg.Proxy.HashrateExpiration)
+	proxy.hashrateExpiration = util.MustParseDuration(cfg.Proxy.HashrateExpiration)
 
-	refreshIntv, _ := time.ParseDuration(cfg.Proxy.BlockRefreshInterval)
+	refreshIntv := util.MustParseDuration(cfg.Proxy.BlockRefreshInterval)
 	refreshTimer := time.NewTimer(refreshIntv)
 	log.Printf("Set block refresh every %v", refreshIntv)
 
-	checkIntv, _ := time.ParseDuration(cfg.UpstreamCheckInterval)
+	checkIntv := util.MustParseDuration(cfg.UpstreamCheckInterval)
 	checkTimer := time.NewTimer(checkIntv)
 
-	stateUpdateIntv, _ := time.ParseDuration(cfg.Proxy.StateUpdateInterval)
+	stateUpdateIntv := util.MustParseDuration(cfg.Proxy.StateUpdateInterval)
 	stateUpdateTimer := time.NewTimer(stateUpdateIntv)
 
 	go func() {
@@ -127,7 +126,7 @@ func NewProxy(cfg *Config, backend *storage.RedisClient) *ProxyServer {
 func (s *ProxyServer) Start() {
 	log.Printf("Starting proxy on %v", s.config.Proxy.Listen)
 	r := mux.NewRouter()
-	r.Handle("/{login:0x[0-9a-fA-F]{40}}/{id:[0-9a-zA-Z\\-\\_]{1,8}}", s)
+	r.Handle("/{login:0x[0-9a-fA-F]{40}}/{id:[0-9a-zA-Z-_]{1,8}}", s)
 	r.Handle("/{login:0x[0-9a-fA-F]{40}}", s)
 	srv := &http.Server{
 		Addr:           s.config.Proxy.Listen,
@@ -168,7 +167,9 @@ func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.remoteAddr(r)
-	s.handleClient(w, r, ip)
+	if !s.policy.IsBanned(ip) {
+		s.handleClient(w, r, ip)
+	}
 }
 
 func (s *ProxyServer) remoteAddr(r *http.Request) string {
@@ -211,13 +212,17 @@ func (cs *Session) handleMessage(s *ProxyServer, r *http.Request, req *JSONRpcRe
 	if req.Id == nil {
 		log.Printf("Missing RPC id from %s", cs.ip)
 		s.policy.ApplyMalformedPolicy(cs.ip)
-		r.Close = true
 		return
 	}
 
 	vars := mux.Vars(r)
 	login := strings.ToLower(vars["login"])
 
+	if !util.IsValidHexAddress(login) {
+		errReply := &ErrorReply{Code: -1, Message: "Invalid login"}
+		cs.sendError(req.Id, errReply)
+		return
+	}
 	if !s.policy.ApplyLoginPolicy(login, cs.ip) {
 		errReply := &ErrorReply{Code: -1, Message: "You are blacklisted"}
 		cs.sendError(req.Id, errReply)
@@ -244,11 +249,12 @@ func (cs *Session) handleMessage(s *ProxyServer, r *http.Request, req *JSONRpcRe
 			}
 			reply, errReply := s.handleSubmitRPC(cs, login, vars["id"], params)
 			if errReply != nil {
-				err = cs.sendError(req.Id, errReply)
+				cs.sendError(req.Id, errReply)
 				break
 			}
 			cs.sendResult(req.Id, &reply)
 		} else {
+			s.policy.ApplyMalformedPolicy(cs.ip)
 			errReply := &ErrorReply{Code: -1, Message: "Malformed request"}
 			cs.sendError(req.Id, errReply)
 		}
@@ -258,7 +264,7 @@ func (cs *Session) handleMessage(s *ProxyServer, r *http.Request, req *JSONRpcRe
 	case "eth_submitHashrate":
 		cs.sendResult(req.Id, true)
 	default:
-		errReply := s.handleUnknownRPC(cs, req)
+		errReply := s.handleUnknownRPC(cs, req.Method)
 		cs.sendError(req.Id, errReply)
 	}
 }

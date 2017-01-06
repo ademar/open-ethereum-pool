@@ -7,10 +7,10 @@ import (
 	"strings"
 	"sync"
 
-	"../rpc"
-	"../util"
-
 	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/sammy007/open-ethereum-pool/rpc"
+	"github.com/sammy007/open-ethereum-pool/util"
 )
 
 const maxBacklog = 3
@@ -30,17 +30,6 @@ type BlockTemplate struct {
 	GetPendingBlockCache *rpc.GetBlockReplyPart
 	nonces               map[string]bool
 	headers              map[string]heightDiffPair
-}
-
-func (t *BlockTemplate) submit(nonce string) bool {
-	t.Lock()
-	defer t.Unlock()
-	_, exist := t.nonces[nonce]
-	if exist {
-		return true
-	}
-	t.nonces[nonce] = true
-	return false
 }
 
 type Block struct {
@@ -84,7 +73,6 @@ func (s *ProxyServer) fetchBlockTemplate() {
 		Height:               height,
 		Difficulty:           big.NewInt(diff),
 		GetPendingBlockCache: pendingReply,
-		nonces:               make(map[string]bool),
 		headers:              make(map[string]heightDiffPair),
 	}
 	// Copy job backlog and add current one
@@ -94,13 +82,13 @@ func (s *ProxyServer) fetchBlockTemplate() {
 	}
 	if t != nil {
 		for k, v := range t.headers {
-			if v.height >= height-maxBacklog {
+			if v.height > height-maxBacklog {
 				newTemplate.headers[k] = v
 			}
 		}
 	}
 	s.blockTemplate.Store(&newTemplate)
-	log.Printf("New block to mine on %s at height: %d / %s", rpc.Name, height, reply[0][0:10])
+	log.Printf("New block to mine on %s at height %d / %s", rpc.Name, height, reply[0][0:10])
 
 	// Stratum
 	if s.config.Proxy.Stratum.Enabled {

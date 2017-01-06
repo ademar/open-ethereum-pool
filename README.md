@@ -2,7 +2,9 @@
 
 ![Miner's stats page](https://15254b2dcaab7f5478ab-24461f391e20b7336331d5789078af53.ssl.cf1.rackcdn.com/ethereum.vanillaforums.com/editor/pe/cf77cki0pjpt.png)
 
-[![Join the chat at https://gitter.im/sammy007/open-ethereum-pool](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/sammy007/open-ethereum-pool?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+[![Join the chat at https://gitter.im/sammy007/open-ethereum-pool](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/sammy007/open-ethereum-pool?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge) [![Build Status](https://travis-ci.org/sammy007/open-ethereum-pool.svg?branch=develop)](https://travis-ci.org/sammy007/open-ethereum-pool) [![Go Report Card](https://goreportcard.com/badge/github.com/sammy007/open-ethereum-pool)](https://goreportcard.com/report/github.com/sammy007/open-ethereum-pool)
+
+[List Of Open Ethereum Pools](https://github.com/sammy007/open-ethereum-pool/wiki/List-Of-Open-Pools)
 
 ### Features
 
@@ -24,52 +26,33 @@
 
 Dependencies:
 
-  * go >= 1.4
+  * go >= 1.5
   * geth
-  * redis-server
-  * nodejs
+  * redis-server >= 2.8.0
+  * nodejs >= 4 LTS
   * nginx
 
-**I highly recommend to use Ubuntu 14.04 LTS.**
+**I highly recommend to use Ubuntu 16.04 LTS.**
 
 First install  [go-ethereum](https://github.com/ethereum/go-ethereum/wiki/Installation-Instructions-for-Ubuntu).
-
-I suggest installing Golang-1.6 from <code>deb http://ppa.launchpad.net/ubuntu-lxc/lxd-stable/ubuntu trusty main</code> PPA.
-
-Export GOPATH:
-
-    export GOPATH=$HOME/go
-
-Install required packages:
-
-    go get github.com/ethereum/ethash
-    go get github.com/ethereum/go-ethereum/common
-    go get github.com/gorilla/mux
-    go get gopkg.in/redis.v3
-    go get github.com/yvasiyarov/gorelic
 
 Clone & compile:
 
     git clone https://github.com/sammy007/open-ethereum-pool.git
     cd open-ethereum-pool
-    go build -o ether-pool main.go
+    make
 
 Install redis-server.
-Install nodejs - I suggest using LTS version >= 4.x from https://github.com/nodesource/distributions or from your Linux distribution.
-
-### Building on Windows
-
-Windows isn't supported however you can try following these instructions
-[geth building instructions](https://github.com/ethereum/go-ethereum/wiki/Installation-instructions-for-Windows).
-For redis it maybe possible to use https://github.com/MSOpenTech/redis/releases.
 
 ### Running Pool
 
-    ./ether-pool config.json
+    ./build/bin/open-ethereum-pool config.json
 
 You can use Ubuntu upstart - check for sample config in <code>upstart.conf</code>.
 
 ### Building Frontend
+
+Install nodejs. I suggest using LTS version >= 4.x from https://github.com/nodesource/distributions or from your Linux distribution or simply install nodejs on Ubuntu Xenial 16.04.
 
 The frontend is a single-page Ember.js application that polls the pool API to render miner stats.
 
@@ -77,7 +60,7 @@ The frontend is a single-page Ember.js application that polls the pool API to re
 
 Change <code>ApiUrl: '//example.net/'</code> in <code>www/config/environment.js</code> to match your domain name. Also don't forget to adjust other options.
 
-    npm install -g ember-cli@2.4.3
+    npm install -g ember-cli@2.9.1
     npm install -g bower
     npm install
     bower install
@@ -158,14 +141,14 @@ otherwise you will get errors on start because of JSON comments.**
     // Require this share difficulty from miners
     "difficulty": 2000000000,
 
-    "hashrateExpiration": "30m",
-
     /* Reply error to miner instead of job if redis is unavailable.
-    Should save electricity to miners if pool is sick and they didn't set up failovers.
+      Should save electricity to miners if pool is sick and they didn't set up failovers.
     */
     "healthCheck": true,
     // Mark pool sick after this number of redis failures.
     "maxFails": 100,
+    // TTL for workers stats, usually should be equal to large hashrate window from API section
+    "hashrateExpiration": "3h",
 
     "policy": {
       "workers": 8,
@@ -186,6 +169,15 @@ otherwise you will get errors on start because of JSON comments.**
         "checkThreshold": 30,
         // Bad miner after this number of malformed requests
         "malformedLimit": 5
+      },
+      // Connection rate limit
+      "limits": {
+        "enabled": false,
+        // Number of initial connections
+        "limit": 30,
+        "grace": "5m",
+        // Increase allowed number of connections on each valid share
+        "limitJump": 10
       }
     }
   },
@@ -196,11 +188,14 @@ otherwise you will get errors on start because of JSON comments.**
     "listen": "0.0.0.0:8080",
     // Collect miners stats (hashrate, ...) in this interval
     "statsCollectInterval": "5s",
-
+    // Purge stale stats interval
+    "purgeInterval": "10m",
     // Fast hashrate estimation window for each miner from it's shares
     "hashrateWindow": "30m",
     // Long and precise hashrate from shares, 3h is cool, keep it
     "hashrateLargeWindow": "3h",
+    // Collect stats for shares/diff ratio for this number of blocks
+    "luckWindow": [64, 128, 256],
     // Max number of payments to display in frontend
     "payments": 50,
     // Max numbers of blocks to display in frontend
@@ -240,11 +235,7 @@ otherwise you will get errors on start because of JSON comments.**
     "endpoint": "127.0.0.1:6379",
     "poolSize": 10,
     "database": 0,
-    /* Generate and specify very strong password for in redis
-      configuration file and specify it here.
-      This is done using the requirepass directive in the configuration file.
-      */
-    "password": "secret"
+    "password": ""
   },
 
   // This module periodically remits ether to miners
@@ -252,10 +243,16 @@ otherwise you will get errors on start because of JSON comments.**
     "enabled": false,
     // Pool fee percentage
     "poolFee": 1.0,
+    // Pool fees beneficiary address (leave it blank to disable fee withdrawals)
+    "poolFeeAddress": "",
+    // Donate 10% from pool fees to developers
+    "donate": true,
     // Unlock only if this number of blocks mined back
     "depth": 120,
     // Simply don't touch this option
     "immatureDepth": 20,
+    // Keep mined transaction fees as pool fees
+    "keepTxFees": false,
     // Run unlocker in this interval
     "interval": "10m",
     // Geth instance node rpc endpoint for unlocking blocks
@@ -267,6 +264,8 @@ otherwise you will get errors on start because of JSON comments.**
   // Pay out miners using this module
   "payouts": {
     "enabled": false,
+    // Require minimum number of peers on node
+    "requirePeers": 25,
     // Run payouts in this interval
     "interval": "12h",
     // Geth instance node rpc endpoint for payouts processing
@@ -281,8 +280,10 @@ otherwise you will get errors on start because of JSON comments.**
     "gas": "21000",
     "gasPrice": "50000000000",
     // Send payment only if miner's balance is >= 0.5 Ether
-    "threshold": 500000000
-  },
+    "threshold": 500000000,
+    // Perform BGSAVE on Redis after successful payouts session
+    "bgsave": false
+  }
 }
 ```
 
@@ -297,10 +298,15 @@ I recommend this deployment strategy:
 
 ### Notes
 
-Unlocking and payouts are sequential, 1st tx go, 2nd waiting for 1st to confirm and so on.
-You can disable that in code. Also, keep in mind that *unlocking and payouts will be stopped in case of any backend or geth failure*.
-You must restart module if you see such errors with the word *suspended*; I recommend running unlocker and payouts in a separate processes.
-Don't run payouts and unlocker as part of mining node.
+* Unlocking and payouts are sequential, 1st tx go, 2nd waiting for 1st to confirm and so on. You can disable that in code. Carefully read `docs/PAYOUTS.md`.
+* Also, keep in mind that **unlocking and payouts will halt in case of backend or node RPC errors**. In that case check everything and restart.
+* You must restart module if you see errors with the word *suspended*.
+* Don't run payouts and unlocker modules as part of mining node. Create separate configs for both, launch independently and make sure you have a single instance of each module running.
+* If `poolFeeAddress` is not specified all pool profit will remain on coinbase address. If it specified, make sure to periodically send some dust back required for payments.
+
+### Alternative Ethereum Implementations
+
+This pool is tested to work with [Ethcore's Parity](https://github.com/ethcore/parity). Mining and block unlocking works, but I am not sure about payouts and suggest to run *official* geth node for payments.
 
 ### Credits
 
@@ -312,4 +318,4 @@ Made by sammy007. Licensed under GPLv3.
 
 ### Donations
 
-Coming Soon: ethereum contract and p2sh script. Please contact subtly on gitter if you would like to donate.
+ETH/ETC: 0xb85150eb365e7df0941f0cf08235f987ba91506a

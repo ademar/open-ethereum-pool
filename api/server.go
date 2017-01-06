@@ -2,16 +2,18 @@ package api
 
 import (
 	"encoding/json"
-	"github.com/gorilla/mux"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"../storage"
-	"../util"
+	"github.com/gorilla/mux"
+
+	"github.com/sammy007/open-ethereum-pool/storage"
+	"github.com/sammy007/open-ethereum-pool/util"
 )
 
 type ApiConfig struct {
@@ -20,9 +22,11 @@ type ApiConfig struct {
 	StatsCollectInterval string `json:"statsCollectInterval"`
 	HashrateWindow       string `json:"hashrateWindow"`
 	HashrateLargeWindow  string `json:"hashrateLargeWindow"`
+	LuckWindow           []int  `json:"luckWindow"`
 	Payments             int64  `json:"payments"`
 	Blocks               int64  `json:"blocks"`
 	PurgeOnly            bool   `json:"purgeOnly"`
+	PurgeInterval        string `json:"purgeInterval"`
 }
 
 type ApiServer struct {
@@ -33,6 +37,7 @@ type ApiServer struct {
 	stats               atomic.Value
 	miners              map[string]*Entry
 	minersMu            sync.RWMutex
+	statsIntv           time.Duration
 }
 
 type Entry struct {
@@ -41,8 +46,8 @@ type Entry struct {
 }
 
 func NewApiServer(cfg *ApiConfig, backend *storage.RedisClient) *ApiServer {
-	hashrateWindow, _ := time.ParseDuration(cfg.HashrateWindow)
-	hashrateLargeWindow, _ := time.ParseDuration(cfg.HashrateLargeWindow)
+	hashrateWindow := util.MustParseDuration(cfg.HashrateWindow)
+	hashrateLargeWindow := util.MustParseDuration(cfg.HashrateLargeWindow)
 	return &ApiServer{
 		config:              cfg,
 		backend:             backend,
@@ -59,15 +64,20 @@ func (s *ApiServer) Start() {
 		log.Printf("Starting API on %v", s.config.Listen)
 	}
 
-	statsIntv, _ := time.ParseDuration(s.config.StatsCollectInterval)
-	statsTimer := time.NewTimer(statsIntv)
-	log.Printf("Set stats collect interval to %v", statsIntv)
+	s.statsIntv = util.MustParseDuration(s.config.StatsCollectInterval)
+	statsTimer := time.NewTimer(s.statsIntv)
+	log.Printf("Set stats collect interval to %v", s.statsIntv)
 
-	// Running only to flush stale data
+	purgeIntv := util.MustParseDuration(s.config.PurgeInterval)
+	purgeTimer := time.NewTimer(purgeIntv)
+	log.Printf("Set purge interval to %v", purgeIntv)
+
+	sort.Ints(s.config.LuckWindow)
+
 	if s.config.PurgeOnly {
 		s.purgeStale()
 	} else {
-		// Immediately collect stats
+		s.purgeStale()
 		s.collectStats()
 	}
 
@@ -75,12 +85,13 @@ func (s *ApiServer) Start() {
 		for {
 			select {
 			case <-statsTimer.C:
-				if s.config.PurgeOnly {
-					s.purgeStale()
-				} else {
+				if !s.config.PurgeOnly {
 					s.collectStats()
 				}
-				statsTimer.Reset(statsIntv)
+				statsTimer.Reset(s.statsIntv)
+			case <-purgeTimer.C:
+				s.purgeStale()
+				purgeTimer.Reset(purgeIntv)
 			}
 		}
 	}()
@@ -112,11 +123,12 @@ func notFound(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *ApiServer) purgeStale() {
-	total, err := s.backend.FlushStaleStats(s.hashrateLargeWindow)
+	start := time.Now()
+	total, err := s.backend.FlushStaleStats(s.hashrateWindow, s.hashrateLargeWindow)
 	if err != nil {
-		log.Printf("Failed to purge stale data from backend: ", err)
+		log.Println("Failed to purge stale data from backend:", err)
 	} else {
-		log.Printf("Purged stale stats from backend, %v shares affected", total)
+		log.Printf("Purged stale stats from backend, %v shares affected, elapsed time %v", total, time.Since(start))
 	}
 }
 
@@ -125,10 +137,17 @@ func (s *ApiServer) collectStats() {
 	stats, err := s.backend.CollectStats(s.hashrateWindow, s.config.Blocks, s.config.Payments)
 	if err != nil {
 		log.Printf("Failed to fetch stats from backend: %v", err)
-	} else {
-		log.Printf("Stats collection finished %s", time.Since(start))
-		s.stats.Store(stats)
+		return
 	}
+	if len(s.config.LuckWindow) > 0 {
+		stats["luck"], err = s.backend.CollectLuckStats(s.config.LuckWindow)
+		if err != nil {
+			log.Printf("Failed to fetch luck stats from backend: %v", err)
+			return
+		}
+	}
+	s.stats.Store(stats)
+	log.Printf("Stats collection finished %s", time.Since(start))
 }
 
 func (s *ApiServer) StatsIndex(w http.ResponseWriter, r *http.Request) {
@@ -197,6 +216,7 @@ func (s *ApiServer) BlocksIndex(w http.ResponseWriter, r *http.Request) {
 		reply["immatureTotal"] = stats["immatureTotal"]
 		reply["candidates"] = stats["candidates"]
 		reply["candidatesTotal"] = stats["candidatesTotal"]
+		reply["luck"] = stats["luck"]
 	}
 
 	err := json.NewEncoder(w).Encode(reply)
@@ -230,40 +250,47 @@ func (s *ApiServer) AccountIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 
 	login := strings.ToLower(mux.Vars(r)["login"])
-	reply, err := s.backend.GetMinerStats(login, s.config.Payments)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		log.Printf("Failed to fetch stats from backend: %v", err)
-		return
-	}
-
 	s.minersMu.Lock()
 	defer s.minersMu.Unlock()
 
-	entry, ok := s.miners[login]
+	reply, ok := s.miners[login]
 	now := util.MakeTimestamp()
+	cacheIntv := int64(s.statsIntv / time.Millisecond)
 	// Refresh stats if stale
-	if !ok || entry.updatedAt < now-5000 {
-		stats, err := s.backend.CollectWorkersStats(s.hashrateWindow, s.hashrateLargeWindow, login)
+	if !ok || reply.updatedAt < now-cacheIntv {
+		exist, err := s.backend.IsMinerExists(login)
+		if !exist {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			log.Printf("Failed to fetch stats from backend: %v", err)
 			return
 		}
-		entry = &Entry{stats: stats, updatedAt: now}
-		s.miners[login] = entry
+
+		stats, err := s.backend.GetMinerStats(login, s.config.Payments)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			log.Printf("Failed to fetch stats from backend: %v", err)
+			return
+		}
+		workers, err := s.backend.CollectWorkersStats(s.hashrateWindow, s.hashrateLargeWindow, login)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			log.Printf("Failed to fetch stats from backend: %v", err)
+			return
+		}
+		for key, value := range workers {
+			stats[key] = value
+		}
+		stats["pageSize"] = s.config.Payments
+		reply = &Entry{stats: stats, updatedAt: now}
+		s.miners[login] = reply
 	}
 
-	reply["workers"] = entry.stats["workers"]
-	reply["workersTotal"] = entry.stats["workersTotal"]
-	reply["workersOnline"] = entry.stats["workersOnline"]
-	reply["workersOffline"] = entry.stats["workersOffline"]
-	reply["hashrate"] = entry.stats["hashrate"]
-	reply["currentHashrate"] = entry.stats["currentHashrate"]
-	reply["pageSize"] = s.config.Payments
-
 	w.WriteHeader(http.StatusOK)
-	err = json.NewEncoder(w).Encode(reply)
+	err := json.NewEncoder(w).Encode(reply.stats)
 	if err != nil {
 		log.Println("Error serializing API response: ", err)
 	}
